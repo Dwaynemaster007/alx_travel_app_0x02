@@ -1,62 +1,129 @@
-import os
+from rest_framework import permissions, viewsets
+from rest_framework.exceptions import PermissionDenied
+
+from .models import Booking, Listing, Review
+from .serializers import BookingSerializer, ListingSerializer, ReviewSerializer
+
+
+class IsOwnerOrReadOnly(permissions.BasePermission):
+    """Anyone can read; only the listing's host can change it."""
+
+    def has_object_permission(self, request, view, obj):
+        return request.method in permissions.SAFE_METHODS or obj.host == request.user
+
+
+class ListingViewSet(viewsets.ModelViewSet):
+    """Browse listings; signed-in users can create them and edit their own."""
+    queryset = Listing.objects.select_related('host')
+    serializer_class = ListingSerializer
+    permission_classes = [permissions.IsAuthenticatedOrReadOnly, IsOwnerOrReadOnly]
+
+    def perform_create(self, serializer):
+        serializer.save(host=self.request.user)
+
+
+class BookingViewSet(viewsets.ModelViewSet):
+    """Users see and manage their own bookings; staff see all of them."""
+    serializer_class = BookingSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        if getattr(self, 'swagger_fake_view', False):  # drf-yasg builds the schema without a user
+            return Booking.objects.none()
+        user = self.request.user
+        queryset = Booking.objects.select_related('listing', 'user')
+        return queryset if user.is_staff else queryset.filter(user=user)
+
+    def perform_create(self, serializer):
+        # Booking.save() works out total_price from the nightly rate
+        booking = serializer.save(user=self.request.user)
+
+
+class ReviewViewSet(viewsets.ModelViewSet):
+    """Anyone can read reviews; signed-in users can post and edit their own."""
+    queryset = Review.objects.select_related('user', 'listing')
+    serializer_class = ReviewSerializer
+    permission_classes = [permissions.IsAuthenticatedOrReadOnly]
+
+    def perform_create(self, serializer):
+        serializer.save(user=self.request.user)
+
+    def perform_update(self, serializer):
+        if serializer.instance.user != self.request.user:
+            raise PermissionDenied('You can only edit your own reviews.')
+        serializer.save()
+
+
+# ---------------- Chapa payments ----------------
+import uuid
+
 import requests
-from django.http import JsonResponse
-from django.views import View
+from django.conf import settings
+from django.shortcuts import get_object_or_404
+from rest_framework import status
+from rest_framework.decorators import api_view, permission_classes
+from rest_framework.response import Response
+
 from .models import Payment
-from dotenv import load_dotenv
-
-load_dotenv()
-
-CHAPA_SECRET_KEY = os.getenv('CHAPA_SECRET_KEY')
-
-class InitiatePaymentView(View):
-    def post(self, request):
-        booking_reference = request.POST.get('booking_reference')
-        amount = request.POST.get('amount')
-
-        headers = {
-            'Authorization': f'Bearer {CHAPA_SECRET_KEY}',
-            'Content-Type': 'application/json'
-        }
-        data = {
-            'amount': amount,
-            'currency': 'ETB',
-            'tx_ref': booking_reference,
-            'callback_url': 'http://localhost:8000/api/verify-payment/'
-        }
-
-        response = requests.post('https://api.chapa.co/v1/transaction/initialize', json=data, headers=headers)
-        res_data = response.json()
-
-        if res_data.get('status') == 'success':
-            transaction_id = res_data['data']['tx_ref']
-            Payment.objects.create(
-                booking_reference=booking_reference,
-                transaction_id=transaction_id,
-                amount=amount,
-                status='Pending'
-            )
-            return JsonResponse({'payment_url': res_data['data']['checkout_url']})
-        return JsonResponse(res_data, status=400)
+from .serializers import PaymentSerializer
 
 
-class VerifyPaymentView(View):
-    def get(self, request):
-        transaction_id = request.GET.get('transaction_id')
+def chapa_headers():
+    return {'Authorization': f'Bearer {settings.CHAPA_SECRET_KEY}', 'Content-Type': 'application/json'}
 
-        headers = {'Authorization': f'Bearer {CHAPA_SECRET_KEY}'}
-        url = f"https://api.chapa.co/v1/transaction/verify/{transaction_id}"
-        response = requests.get(url, headers=headers)
-        res_data = response.json()
 
-        try:
-            payment = Payment.objects.get(transaction_id=transaction_id)
-            if res_data.get('status') == 'success' and res_data['data']['status'] == 'success':
-                payment.status = 'Completed'
-            else:
-                payment.status = 'Failed'
-            payment.save()
-        except Payment.DoesNotExist:
-            return JsonResponse({'error': 'Payment record not found'}, status=404)
+@api_view(['POST'])
+@permission_classes([permissions.IsAuthenticated])
+def initiate_payment(request):
+    """Start a Chapa payment for one of your bookings. Body: {"booking": <id>}."""
+    if not settings.CHAPA_SECRET_KEY:
+        return Response({'error': 'CHAPA_SECRET_KEY is not configured.'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
-        return JsonResponse(res_data)
+    booking = get_object_or_404(Booking, pk=request.data.get('booking'), user=request.user)
+    reference = f'booking-{booking.id}-{uuid.uuid4().hex[:10]}'
+    payload = {
+        'amount': str(booking.total_price),
+        'currency': 'ETB',
+        'email': request.user.email or 'guest@example.com',
+        'first_name': request.user.first_name or request.user.username,
+        'last_name': request.user.last_name or 'Guest',
+        'tx_ref': reference,
+        'return_url': f'{settings.CHAPA_RETURN_URL}?tx_ref={reference}',
+        'customization': {'title': 'ALX Travel', 'description': f'Booking {booking.id}'},
+    }
+    try:
+        response = requests.post(f'{settings.CHAPA_BASE_URL}/transaction/initialize', json=payload, headers=chapa_headers(), timeout=15)
+        data = response.json()
+    except (requests.RequestException, ValueError):
+        return Response({'error': 'Could not reach Chapa.'}, status=status.HTTP_502_BAD_GATEWAY)
+
+    if response.status_code != 200 or data.get('status') != 'success':
+        return Response({'error': 'Chapa rejected the payment.', 'details': data}, status=status.HTTP_400_BAD_REQUEST)
+
+    payment = Payment.objects.create(booking=booking, booking_reference=reference, amount=booking.total_price)
+    return Response(
+        {'payment': PaymentSerializer(payment).data, 'checkout_url': data['data']['checkout_url']},
+        status=status.HTTP_201_CREATED,
+    )
+
+
+@api_view(['GET'])
+@permission_classes([permissions.AllowAny])
+def verify_payment(request):
+    """Check a payment with Chapa and update its status. Query: ?tx_ref=<booking_reference>."""
+    payment = get_object_or_404(Payment, booking_reference=request.query_params.get('tx_ref'))
+    try:
+        response = requests.get(f'{settings.CHAPA_BASE_URL}/transaction/verify/{payment.booking_reference}', headers=chapa_headers(), timeout=15)
+        data = response.json()
+    except (requests.RequestException, ValueError):
+        return Response({'error': 'Could not reach Chapa.'}, status=status.HTTP_502_BAD_GATEWAY)
+
+    if data.get('status') == 'success' and data.get('data', {}).get('status') == 'success':
+        payment.status = Payment.Status.COMPLETED
+        payment.transaction_id = data['data'].get('reference') or payment.transaction_id
+        payment.booking.status = Booking.Status.CONFIRMED
+        payment.booking.save(update_fields=['status'])
+    else:
+        payment.status = Payment.Status.FAILED
+    payment.save()
+    return Response(PaymentSerializer(payment).data)
